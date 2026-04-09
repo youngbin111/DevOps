@@ -1,6 +1,6 @@
 services:
   web:
-    image: gonas0919/my-ncp:latest
+    image: dwbhyoung/my-ncp:latest
     container_name: flask_app
     expose:
       - "5000"
