@@ -5,7 +5,7 @@ on:
     branches:
       - main
       - dev
-      - yb
+      - "feature/**"
   pull_request:
     branches:
       - dev
@@ -75,7 +75,7 @@ jobs:
       - name: Build and start full stack
         run: docker compose up -d --build
 
-      # - name: Health smoke test    ->api요청 보내보기
+      # - name: Health smoke test
       #   run: |
       #     for i in $(seq 1 20); do
       #       if curl -fsS http://127.0.0.1:5000/health > /dev/null; then

@@ -38,7 +38,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Trivy image scan (HIGH/CRITICAL fail)
-        uses: aquasecurity/trivy-action@0.33.1
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           version: v0.69.3
           token-setup-trivy: ${{ secrets.GITHUB_TOKEN }}
@@ -49,34 +49,87 @@ jobs:
           exit-code: '1'
           format: table
 
+      - name: Validate deploy secrets
+        run: |
+          test -n "${{ secrets.DOMAIN }}" || (echo "DOMAIN secret is required" && exit 1)
+          test -n "${{ secrets.LETSENCRYPT_EMAIL }}" || (echo "LETSENCRYPT_EMAIL secret is required" && exit 1)
+
       - name: Prepare SSH key
         run: |
           mkdir -p ~/.ssh
           echo "${{ secrets.NCP_SSH_KEY }}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
-          ssh-keyscan -H ${{ secrets.NCP_HOST }} >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${{ secrets.NCP_HOST }}" >> ~/.ssh/known_hosts
 
       - name: Prepare remote deploy directory
         run: |
-          ssh -i ~/.ssh/id_rsa ${{ secrets.NCP_USER }}@${{ secrets.NCP_HOST }} "mkdir -p /tmp/my_repo"
+          ssh -i ~/.ssh/id_rsa "${{ secrets.NCP_USER }}@${{ secrets.NCP_HOST }}" "mkdir -p ~/my_repo/certbot/config ~/my_repo/certbot/www"
 
       - name: Copy deploy files
         run: |
           scp -i ~/.ssh/id_rsa -r docker-compose.yml nginx \
-            ${{ secrets.NCP_USER }}@${{ secrets.NCP_HOST }}:/tmp/my_repo/
+            "${{ secrets.NCP_USER }}@${{ secrets.NCP_HOST }}:~/my_repo/"
 
-      - name: Select image to deploy
+      - name: Select image and TLS settings
         run: |
-          ssh -i ~/.ssh/id_rsa ${{ secrets.NCP_USER }}@${{ secrets.NCP_HOST }} "
-            echo APP_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/my-ncp:${{ github.event.workflow_run.head_sha }} > /tmp/my_repo/.env
-          "
+          ssh -i ~/.ssh/id_rsa "${{ secrets.NCP_USER }}@${{ secrets.NCP_HOST }}" 'cat > ~/my_repo/.env' <<EOF
+          APP_IMAGE=${{ secrets.DOCKERHUB_USERNAME }}/my-ncp:${{ github.event.workflow_run.head_sha }}
+          DOMAIN=${{ secrets.DOMAIN }}
+          LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
+          EOF
 
       - name: Deploy on NCP
         run: |
-          ssh -i ~/.ssh/id_rsa ${{ secrets.NCP_USER }}@${{ secrets.NCP_HOST }} "
-            cd /tmp/my_repo &&
-            systemctl stop nginx || true &&
-            systemctl disable nginx || true &&
-            docker compose pull &&
-            docker compose up -d --remove-orphans
-          "
+          ssh -i ~/.ssh/id_rsa "${{ secrets.NCP_USER }}@${{ secrets.NCP_HOST }}" 'sh -s' <<'REMOTE'
+          set -eu
+          cd "$HOME/my_repo"
+          set -a
+          . ./.env
+          set +a
+
+          systemctl stop nginx || true
+          systemctl disable nginx || true
+
+          docker compose --profile certbot pull
+          docker compose up -d --remove-orphans web nginx
+
+          if [ ! -f "certbot/config/live/$DOMAIN/fullchain.pem" ]; then
+            docker compose --profile certbot run --rm certbot certonly \
+              --webroot \
+              --webroot-path=/var/www/certbot \
+              --non-interactive \
+              --agree-tos \
+              --no-eff-email \
+              --email "$LETSENCRYPT_EMAIL" \
+              -d "$DOMAIN"
+          else
+            docker compose --profile certbot run --rm certbot renew \
+              --webroot \
+              --webroot-path=/var/www/certbot \
+              --quiet
+          fi
+
+          docker compose up -d --force-recreate nginx
+          docker compose exec -T nginx nginx -t
+          REMOTE
+
+      - name: HTTP/HTTPS smoke test
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsSI --connect-timeout 5 --max-time 10 "http://${{ secrets.DOMAIN }}" > /dev/null && \
+               curl -fsS --connect-timeout 5 --max-time 10 "https://${{ secrets.DOMAIN }}/health" > /dev/null; then
+              echo "HTTP and HTTPS smoke tests passed"
+              exit 0
+            fi
+            echo "Waiting for HTTPS deployment... ($i/30)"
+            sleep 5
+          done
+          echo "HTTP/HTTPS smoke tests failed"
+          exit 1
+
+      - name: TLS certificate check
+        run: |
+          echo | openssl s_client \
+            -connect "${{ secrets.DOMAIN }}:443" \
+            -servername "${{ secrets.DOMAIN }}" 2>/dev/null \
+            | openssl x509 -noout -subject -issuer -dates
